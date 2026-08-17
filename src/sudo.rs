@@ -230,7 +230,10 @@ where
     let capability = BridgeCapability::generate()?;
 
     let mut cmd = Command::new(sudo_bin);
-    cmd.arg("-A");
+    // Ignore any existing timestamp and do not create a reusable one. Sudo's
+    // `-k` command mode keeps authentication and execution in this one process
+    // while ensuring the next PASSWD command must authenticate independently.
+    cmd.args(["-A", "-k"]);
     cmd.env("SUDO_ASKPASS", askpass_path);
     cmd.env(ROLE_ENV, "bridge");
     cmd.env(BRIDGE_SOCKET_ENV, &socket_path);
@@ -623,14 +626,17 @@ async fn run_command(
     timeout_secs: u64,
 ) -> Result<String> {
     let mut cmd = Command::new(sudo_bin);
-    cmd.arg("-A");
+    // Match the MCP path's per-command authentication semantics. In command
+    // mode `-k` both ignores an existing timestamp and prevents this successful
+    // authentication from updating the timestamp cache.
+    cmd.args(["-A", "-k"]);
     cmd.env("SUDO_ASKPASS", self_path);
     cmd.env(ROLE_ENV, "askpass");
     cmd.env(ASKPASS_CONTEXT_ENV, context_path);
     cmd.env(ASKPASS_CONTEXT_DIGEST_ENV, context_digest);
     configure_command(&mut cmd, input);
     // Native askpass does not provide a trustworthy signal that distinguishes
-    // cached/NOPASSWD execution from password authentication. Suppress stderr
+    // NOPASSWD execution from password authentication. Suppress stderr
     // at the descriptor boundary so authentication diagnostics can never be
     // returned or retained alongside target-command stderr.
     cmd.stderr(Stdio::null());
@@ -978,7 +984,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(args).expect("sudo arguments"),
-            "-A\n--\ntarget-command\n"
+            "-A\n-k\n--\ntarget-command\n"
         );
     }
 
@@ -1110,10 +1116,12 @@ mod tests {
         let copied_context = dir.path().join("copied-context");
         let context_path = dir.path().join("context-path");
         let context_digest_path = dir.path().join("context-digest");
+        let args_path = dir.path().join("args");
         executable_script(
             &script,
             &format!(
-                "#!/bin/sh\nprintf '%s' \"$SUDO_MCP_ASKPASS_CONTEXT\" > {path}\nprintf '%s' \"$SUDO_MCP_ASKPASS_CONTEXT_SHA256\" > {digest}\ncp \"$SUDO_MCP_ASKPASS_CONTEXT\" {context}\nprintf native\nprintf 'native command stderr' >&2\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {args}\nprintf '%s' \"$SUDO_MCP_ASKPASS_CONTEXT\" > {path}\nprintf '%s' \"$SUDO_MCP_ASKPASS_CONTEXT_SHA256\" > {digest}\ncp \"$SUDO_MCP_ASKPASS_CONTEXT\" {context}\nprintf native\nprintf 'native command stderr' >&2\n",
+                args = shell_quote(&args_path),
                 path = shell_quote(&context_path),
                 digest = shell_quote(&context_digest_path),
                 context = shell_quote(&copied_context),
@@ -1143,6 +1151,12 @@ mod tests {
         );
         let context_digest = std::fs::read_to_string(context_digest_path).expect("context digest");
         assert_eq!(context_digest.len(), 64);
+        let args = std::fs::read_to_string(args_path).expect("native sudo arguments");
+        let mut args = args.lines();
+        assert_eq!(args.next(), Some("-A"));
+        assert_eq!(args.next(), Some("-k"));
+        assert_eq!(args.next(), Some("--"));
+        assert_eq!(args.count(), 16);
         assert!(crate::integrity::matches_sha256(
             &std::fs::read(copied_context).expect("copied context"),
             &context_digest,
