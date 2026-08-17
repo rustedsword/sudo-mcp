@@ -2,7 +2,37 @@ use std::process::Command;
 
 use anyhow::{anyhow, Result};
 
+// Native GUI helpers receive their prompt as one process argument. Keep the
+// complete argument well below Linux's 128 KiB MAX_ARG_STRLEN boundary and
+// leave room for AppleScript escaping, helper flags, and implementation detail.
+pub(crate) const MAX_NATIVE_PROMPT_BYTES: usize = 60 * 1024;
+pub(crate) const MAX_NATIVE_AUTHORIZATION_BYTES: usize = 32 * 1024;
+
+pub(crate) fn validate_native_authorization(summary: &str) -> Result<()> {
+    if summary.len() > MAX_NATIVE_AUTHORIZATION_BYTES {
+        return Err(anyhow!(
+            "native authorization text is too large for a GUI password prompt ({} bytes; maximum {}); shorten the reason, command arguments, or working directory",
+            summary.len(),
+            MAX_NATIVE_AUTHORIZATION_BYTES,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_native_prompt(message: &str) -> Result<()> {
+    if message.len() > MAX_NATIVE_PROMPT_BYTES {
+        return Err(anyhow!(
+            "native GUI password prompt is too large ({} bytes; maximum {})",
+            message.len(),
+            MAX_NATIVE_PROMPT_BYTES,
+        ));
+    }
+    Ok(())
+}
+
 pub fn prompt_password(message: &str) -> Result<Vec<u8>> {
+    validate_native_prompt(message)?;
+
     #[cfg(target_os = "macos")]
     {
         prompt_darwin(message)
@@ -24,7 +54,7 @@ fn prompt_darwin(message: &str) -> Result<Vec<u8>> {
     // Real newlines pass through fine.
     let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
-        "display dialog \"{escaped}\" default answer \"\" with hidden answer with title \"Claude Code sudo-mcp\" with icon caution\ntext returned of result"
+        "display dialog \"{escaped}\" default answer \"\" with hidden answer with title \"sudo-mcp\" with icon caution\ntext returned of result"
     );
     let output = Command::new("/usr/bin/osascript")
         .arg("-e")
@@ -50,11 +80,11 @@ fn prompt_linux(message: &str) -> Result<Vec<u8>> {
         ("ksshaskpass", vec![message]),
         (
             "zenity",
-            vec!["--password", "--title=Claude Code sudo-mcp", &zenity_text],
+            vec!["--password", "--title=sudo-mcp", &zenity_text],
         ),
         (
             "kdialog",
-            vec!["--title", "Claude Code sudo-mcp", "--password", message],
+            vec!["--title", "sudo-mcp", "--password", message],
         ),
     ];
 
@@ -83,4 +113,19 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_prompt_limits_are_enforced_at_the_byte_boundary() {
+        assert!(validate_native_authorization(&"x".repeat(MAX_NATIVE_AUTHORIZATION_BYTES)).is_ok());
+        assert!(
+            validate_native_authorization(&"x".repeat(MAX_NATIVE_AUTHORIZATION_BYTES + 1)).is_err()
+        );
+        assert!(validate_native_prompt(&"x".repeat(MAX_NATIVE_PROMPT_BYTES)).is_ok());
+        assert!(validate_native_prompt(&"x".repeat(MAX_NATIVE_PROMPT_BYTES + 1)).is_err());
+    }
 }
