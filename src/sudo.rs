@@ -22,8 +22,6 @@ use crate::{
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TIMEOUT_SECONDS: u64 = 3600;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-const STDERR_SUPPRESSED_MESSAGE: &str =
-    "[suppressed: sudo authentication diagnostics and command stderr are not separable]";
 #[cfg(unix)]
 const BRIDGE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_CLEANUP_GRACE: Duration = Duration::from_secs(5);
@@ -274,7 +272,7 @@ where
                 false,
                 timeout_secs,
                 &stdout,
-                Some(&stderr),
+                &stderr,
             ))
         }
         InitialEvent::TimedOut => {
@@ -286,7 +284,7 @@ where
                 true,
                 timeout_secs,
                 &stdout,
-                Some(&stderr),
+                &stderr,
             ))
         }
         InitialEvent::Authentication(stream) => {
@@ -322,10 +320,9 @@ where
                 return Err(error);
             }
             drop(stream);
-            // From this point onward, neither returned output nor its shape
-            // may depend on the password. Sudo authentication diagnostics and
-            // target stderr share fd 2, so discard that entire channel. Target
-            // stdout is returned byte-for-byte (subject only to size bounds).
+            // Returned output must never be transformed based on the password.
+            // Trust the local sudo/PAM stack not to echo credentials and return
+            // its mixed diagnostics/target-stderr stream unchanged.
             drop(password);
 
             let (status, timed_out) =
@@ -337,13 +334,13 @@ where
                     }
                 };
             let stdout = collect_task_output(stdout_task).await;
-            zeroize_task_output(stderr_task).await;
+            let stderr = collect_task_output(stderr_task).await;
             Ok(format_command_output(
                 status,
                 timed_out,
                 timeout_secs,
                 &stdout,
-                None,
+                &stderr,
             ))
         }
     }
@@ -608,15 +605,6 @@ async fn abort_waiting_child(
     zeroize_task_output(stderr_task).await;
 }
 
-async fn abort_waiting_child_stdout(
-    child: &mut tokio::process::Child,
-    stdout_task: tokio::task::JoinHandle<Vec<u8>>,
-) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-    zeroize_task_output(stdout_task).await;
-}
-
 async fn run_command(
     input: &SudoRunInput,
     sudo_bin: &Path,
@@ -635,30 +623,26 @@ async fn run_command(
     cmd.env(ASKPASS_CONTEXT_ENV, context_path);
     cmd.env(ASKPASS_CONTEXT_DIGEST_ENV, context_digest);
     configure_command(&mut cmd, input);
-    // Native askpass does not provide a trustworthy signal that distinguishes
-    // NOPASSWD execution from password authentication. Suppress stderr
-    // at the descriptor boundary so authentication diagnostics can never be
-    // returned or retained alongside target-command stderr.
-    cmd.stderr(Stdio::null());
 
     let mut child = cmd.spawn()?;
     let pid = child.id();
-    let stdout_task = capture_child_stdout(&mut child);
+    let (stdout_task, stderr_task) = capture_child_output(&mut child);
     let (status, timed_out) = match wait_for_child(&mut child, pid, sudo_bin, timeout_secs).await {
         Ok(result) => result,
         Err(error) => {
-            abort_waiting_child_stdout(&mut child, stdout_task).await;
+            abort_waiting_child(&mut child, stdout_task, stderr_task).await;
             return Err(error);
         }
     };
     let stdout_bytes = collect_task_output(stdout_task).await;
+    let stderr_bytes = collect_task_output(stderr_task).await;
 
     Ok(format_command_output(
         status,
         timed_out,
         timeout_secs,
         &stdout_bytes,
-        None,
+        &stderr_bytes,
     ))
 }
 
@@ -743,20 +727,17 @@ fn format_command_output(
     timed_out: bool,
     timeout_secs: u64,
     stdout: &[u8],
-    stderr: Option<&[u8]>,
+    stderr: &[u8],
 ) -> String {
     if timed_out {
         return format!("sudo-mcp: command timed out after {timeout_secs}s");
     }
 
     let exit_code = status.and_then(|value| value.code()).unwrap_or(-1);
-    let stderr = stderr
-        .map(truncate)
-        .unwrap_or_else(|| STDERR_SUPPRESSED_MESSAGE.to_string());
     format!(
         "exit_code: {exit_code}\n--- stdout ---\n{}\n--- stderr ---\n{}",
         truncate(stdout),
-        stderr,
+        truncate(stderr),
     )
 }
 
@@ -990,7 +971,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn authenticated_output_does_not_reveal_matching_candidates() {
+    async fn authenticated_output_is_unfiltered_and_password_independent() {
         let _fixture_guard = EXECUTABLE_SCRIPT_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("fake-sudo");
@@ -998,7 +979,7 @@ mod tests {
         let expected_bridge = std::env::current_exe().expect("test binary");
         executable_script(
             &script,
-            "#!/bin/sh\npassword=$(\"$SUDO_ASKPASS\" 'Password:') || exit 1\nprintf 'candidate:one\\ncandidate:two\\ncandidate:three\\n'\nprintf 'auth-diagnostic:%s\\ncommand stderr\\n' \"$password\" >&2\n",
+            "#!/bin/sh\npassword=$(\"$SUDO_ASKPASS\" 'Password:') || exit 1\ncase \"$password\" in one|two) ;; *) exit 1 ;; esac\nprintf 'stdout-candidate:one\\nstdout-candidate:two\\n'\nprintf 'stderr-candidate:one\\nstderr-candidate:two\\nsudo diagnostic\\ncommand stderr\\n' >&2\n",
         );
 
         let first = run_bridged_command(
@@ -1023,11 +1004,12 @@ mod tests {
         .expect("second authenticated command completes");
 
         assert_eq!(first, second, "output varied with the submitted password");
-        assert!(first.contains("candidate:one"), "{first}");
-        assert!(first.contains("candidate:two"), "{first}");
-        assert!(first.contains(STDERR_SUPPRESSED_MESSAGE), "{first}");
-        assert!(!first.contains("auth-diagnostic"), "{first}");
-        assert!(!first.contains("\ncommand stderr\n"), "{first}");
+        assert!(first.contains("stdout-candidate:one"), "{first}");
+        assert!(first.contains("stdout-candidate:two"), "{first}");
+        assert!(first.contains("stderr-candidate:one"), "{first}");
+        assert!(first.contains("stderr-candidate:two"), "{first}");
+        assert!(first.contains("sudo diagnostic"), "{first}");
+        assert!(first.contains("command stderr"), "{first}");
         assert!(!first.contains("[redacted]"), "{first}");
     }
 
@@ -1135,8 +1117,7 @@ mod tests {
             .expect("bounded authorization context remains executable");
 
         assert!(output.contains("native"), "{output}");
-        assert!(output.contains(STDERR_SUPPRESSED_MESSAGE), "{output}");
-        assert!(!output.contains("native command stderr"), "{output}");
+        assert!(output.contains("native command stderr"), "{output}");
         assert!(
             std::fs::metadata(&copied_context)
                 .expect("copied context")

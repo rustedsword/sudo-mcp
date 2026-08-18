@@ -87,7 +87,7 @@ impl SudoServer {
     }
 
     #[tool(
-        description = "Run a single command as root. When authentication is needed, sudo-mcp asks the user for the password through MCP elicitation; the password is not a tool argument or result. Clients without form elicitation use a native OS dialog. Pass argv as a list, not a shell string, and include a short `reason` describing what the user is authorizing."
+        description = "Run a single command as root. When authentication is needed, sudo-mcp asks the user for the password through MCP elicitation; the password is not a tool argument and is never intentionally added to the result. Clients without form elicitation use a native OS dialog. Results include the exit code, stdout, and combined sudo/PAM/command stderr, with at most 256 KiB from each stream rendered as text. Pass argv as a list, not a shell string, and include a short `reason` describing what the user is authorizing."
     )]
     async fn sudo_run(
         &self,
